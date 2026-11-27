@@ -39,11 +39,14 @@ This document is the exact path I followed, including the mistakes I made on the
 13. [Step 10: The workflow and project files](#step-10-the-workflow-and-project-files)
 14. [Step 11: Make the check required](#step-11-make-the-check-required)
 15. [Step 12: Prove it works with a test PR](#step-12-prove-it-works)
-16. [How developers use it day to day](#how-developers-use-it-day-to-day)
-17. [Troubleshooting: every error I actually hit](#troubleshooting)
-18. [Security notes](#security-notes)
-19. [Maintenance](#maintenance)
-20. [What's next: future enhancements](#whats-next)
+16. [Step 13: Users, groups and permissions](#step-13-users-groups-and-permissions)
+17. [Step 14: Log in with your GitHub organisation](#step-14-log-in-with-your-github-organisation)
+18. [Step 15: Add another repository](#step-15-add-another-repository)
+19. [How developers use it day to day](#how-developers-use-it-day-to-day)
+20. [Troubleshooting: every error I actually hit](#troubleshooting)
+21. [Security notes](#security-notes)
+22. [Maintenance](#maintenance)
+23. [What's next: future enhancements](#whats-next)
 
 ---
 
@@ -76,9 +79,12 @@ The pieces:
 | SonarQube server (Docker on a VM) | Runs the analysis and stores the results |
 | PostgreSQL (same Docker host) | SonarQube's database |
 | Load balancer + DNS | Gives the server an HTTPS address, reachable only from allowed IPs |
-| GitHub App | Lets SonarQube read the repo list and post results on pull requests |
+| GitHub App | Lets SonarQube read the repo list, post results on pull requests, and log people in with their GitHub organisation account |
 | GitHub Actions workflow | Runs the scanner on every PR and push |
 | Branch ruleset | Makes the "SonarQube" check required, so a red check blocks the merge |
+| Groups and permissions | Developers can read results; only leads can accept an issue or mark a hotspot safe |
+
+Steps 1–12 set this up for one repository. Steps 13–15 turn it into an organisation setup: permissions, GitHub login, and the checklist for every further repository.
 
 ---
 
@@ -542,16 +548,185 @@ Also check a clean PR goes **green**. Ours (a revert that only deleted code) pas
 
 ---
 
+## Step 13: Users, groups and permissions
+
+A quality gate is only as strong as the people who can override it. In SonarQube, anyone with **Administer Issues** can mark an issue *Accepted* or *False positive*, and anyone with **Administer Security Hotspots** can mark a hotspot *Safe*. Either way it stops counting, and a red PR turns green without a single line of code changing.
+
+> **Gotcha I hit:** out of the box, the `sonar-users` group, which means *every person who
+> logs in*, had both of those permissions on our projects. Any developer could have passed
+> their own gate. Check this before you let more people in (step 14).
+
+### Who gets what
+
+| Who | Group / user | Purpose |
+|---|---|---|
+| SonarQube admins | `sonar-administrators` (built in) | Manage the server and projects |
+| Everyone who logs in | `sonar-users` (built in) | Read results and code |
+| Team leads | `tech-leads` (you create it) | Accept issues, review security hotspots |
+| The pipeline | `ci-github` (local user, step 8) | Run scans, nothing else |
+
+Permissions on each project:
+
+| | Browse | See Source Code | Administer Issues | Administer Security Hotspots | Administer | Execute Analysis |
+|---|---|---|---|---|---|---|
+| `sonar-administrators` | ✅ | ✅ | | | ✅ | |
+| `sonar-users` | ✅ | ✅ | ❌ | ❌ | | |
+| `tech-leads` | ✅ | ✅ | ✅ | ✅ | | |
+| `ci-github` | ✅ | | | | | ✅ |
+
+`ci-github` needs **Browse** as well as Execute Analysis: the workflow reads the quality gate result back, and that's a read.
+
+### Set it up
+
+1. **Create the leads group:** **Administration → Security → Groups → Create Group** → `tech-leads`. Add members once they have logged in (after step 14 a user appears on their first GitHub login).
+2. **Fix each existing project:** **Project → Project settings → Permissions**:
+   - **Visibility → Private.** A *Public* project can be browsed without these permissions.
+   - Set the table above: untick Administer Issues and Administer Security Hotspots for `sonar-users`; add `tech-leads` and `ci-github`.
+3. **Make new projects start right:** **Administration → Security → Permission Templates → Default template** → the same table. Every project imported later gets it automatically.
+4. **Private by default:** **Administration → Projects → Management → Default visibility of new projects → Private.**
+
+> **Gotcha I hit:** a project imported from GitHub showed **Public** even though I thought I had
+> set the default to private. After every import, look at the badge next to the project name.
+
+---
+
+## Step 14: Log in with your GitHub organisation
+
+A shared login tells you nothing about who accepted an issue. With GitHub login, everyone signs in with their own organisation account, and leaving the organisation means losing SonarQube access too. You reuse the **same GitHub App** from step 4.
+
+If your GitHub organisation signs people in through a company identity provider (Microsoft Entra ID / Azure AD, Okta and so on, called *Enterprise Managed Users*), the chain becomes:
+
+```
+SonarQube "Log in with GitHub" → GitHub → company sign-in (with MFA) → back to SonarQube
+```
+
+**Do step 13 first.** The moment GitHub login is on, every member of the organisation can log in and lands in `sonar-users`.
+
+### 14.1 Give the GitHub App two more permissions
+
+The permissions are edited on the **app's own settings page**: org **Settings → Developer settings → GitHub Apps → your app → Edit → Permissions & events**. The installation page (org Settings → GitHub Apps → Configure) only controls which repositories the app can use.
+
+| Section | Permission | Access |
+|---|---|---|
+| Organization permissions | Members | Read-only (to check the user belongs to your org) |
+| Account permissions | Email addresses | Read-only |
+
+While you're there, set anything SonarQube doesn't need back to **No access**. I had picked *Organization → Administration* by mistake earlier.
+
+**Save changes**, then an org owner must **accept** them: org **Settings → GitHub Apps → your app** → the banner about new permissions → **Accept new permissions**. Until then nothing changes.
+
+The callback URL SonarQube needs, `https://sonarqube.example.com/oauth2/callback/github`, is already on the app from step 4.
+
+### 14.2 Turn on GitHub login in SonarQube
+
+**Administration → Configuration → General Settings → Authentication → GitHub** → **Configure manually**. Don't use "Create GitHub App": you already have one.
+
+| Field | Value |
+|---|---|
+| Client ID | from the app's General page |
+| Client Secret | the app's **Credentials → Client secrets**. You can't view an old one again, so generate a new one; the old one keeps working for the DevOps integration |
+| GitHub App ID | from the app's General page |
+| Private key | the whole `.pem` (generate a new key if you deleted the file) |
+| GitHub URL / API URL | `https://github.com/` and `https://api.github.com/` |
+| Organizations | `your-org`: only members can log in |
+| Allow users to sign up | On: a user is created on their first login |
+| Synchronize teams as groups (if shown) | Optional: GitHub teams become SonarQube groups |
+
+**Save configuration**, then **Enable**. If asked how to provision users, choose **just-in-time** (on first login).
+
+### 14.3 Test it
+
+Open SonarQube in a private window → **Log in with GitHub** → **Authorize** the app on first use → you land in SonarQube as yourself. Check you can see the projects but can't accept issues.
+
+> **Gotcha I hit:** in the private window GitHub's password form said
+> **"Incorrect username or password"**. With Enterprise Managed Users there *is* no GitHub
+> password: you sign in through the company identity provider. Either test in a browser
+> that's already signed in to GitHub, or start the sign-in from your enterprise's SSO page
+> first. Normal users never see this, because they're already signed in to GitHub.
+
+### 14.4 Keep these local
+
+- **`admin`:** your way in if GitHub or the identity provider is down. Strong password, not shared.
+- **`ci-github`:** the pipeline uses its token; it never logs in through GitHub.
+- **Old local accounts:** once someone has logged in with GitHub, deactivate their local account (**Administration → Security → Users**), so each person has one account.
+
+---
+
+## Step 15: Add another repository
+
+The server, the GitHub App, the IP allow list, the quality gate and GitHub login are shared. Each further repository takes about fifteen minutes. This is the checklist I use.
+
+| # | Where | Do |
+|---|---|---|
+| 1 | GitHub org | **Settings → GitHub Apps → your app → Configure → Repository access** → add the repo → Save |
+| 2 | SonarQube | **Projects → Create project → Import from GitHub** → tick the repo → Import → New code: *Follows the instance's default* → Create |
+| 3 | SonarQube | **Project settings → Update key** → a short key, e.g. `your-other-app` (must match the repo file) |
+| 4 | SonarQube | **Project settings → Permissions** → Private + the step 13 table |
+| 5 | SonarQube | **Quality Gates** → your gate → **Projects → Without** → tick the project |
+| 6 | SonarQube (as `ci-github`) | **My Account → Security** → Project Analysis Token for this project |
+| 7 | GitHub repo | **Repository** secret `SONAR_TOKEN`, **repository** variable `SONAR_HOST_URL` |
+| 8 | Git | The two files from step 10, on a branch from **every long-lived base branch** (e.g. `main` and `staging`), identical on each |
+| 9 | GitHub repo | Open the PRs, **only after step 7**. Expect SonarQube ✅ |
+| 10 | GitHub repo | Merge them. The push to `main` scans the main branch |
+| 11 | GitHub repo | Ruleset: require `SonarQube`, **after** the workflow is on every base branch |
+| 12 | GitHub repo | A draft PR with a deliberate issue goes red → close it |
+
+Two tips save time:
+
+- **Skip the "Analysis Method" page** that appears after an import (and the **Configure analysis** link on the project card). It's a tutorial for writing a workflow; you already have one. It disappears after the first scan.
+- **Set your gate as the default once** (**Quality Gates → your gate → ⋮ → Set as Default**), and new projects get it without step 5.
+
+### When the app is in a subfolder
+
+`sonar-project.properties` for a repo whose app lives in `src/`, with its own `package.json` and tests:
+
+```properties
+sonar.projectKey=your-other-app
+sonar.projectName=your-other-app
+sonar.sourceEncoding=UTF-8
+
+sonar.sources=src
+sonar.tests=src/tests
+sonar.test.inclusions=src/tests/**
+sonar.exclusions=src/tests/**,src/public/**,src/docs/**,**/*.md,**/*.css,**/*.d.ts
+sonar.typescript.tsconfigPaths=src/tsconfig.json
+```
+
+Tests are excluded from `sonar.sources` and listed under `sonar.tests`, because a file can't be both.
+
+> **Gotchas I hit while adding more repositories:**
+>
+> - **The required check waited forever:** "SonarQube — Expected — Waiting for status to be
+>   reported". GitHub only runs workflows found in the PR's code merged with its base branch.
+>   The rule was required on `main` before the workflow file was on `main`, so PRs from
+>   branches cut from `main` never started the job. Put the file on every base branch
+>   **first**, then require the check. Stuck PRs start the job after **Update branch**.
+> - **The PRs were opened before the token existed** and SonarQube failed in seconds. You
+>   don't need new PRs: **re-run the failed job** (Checks → SonarQube → Re-run).
+> - **"Project's Main Branch is not analyzed yet"** stays until the workflow is on `main` and
+>   something is pushed there. Merging the PR does that; **Actions → SonarQube → Run
+>   workflow → `main`** also works once the file is on `main`.
+> - **A project card showed the wrong branch.** SonarQube uses GitHub's default branch as the
+>   main branch at import. If you renamed it, rename it back (branch selector → **Manage
+>   branches**) so the card shows `main`.
+> - **Other red checks on the same PR weren't SonarQube.** A repository's existing checks can
+>   fail for their own reasons: missing CI variables, a cloud role that doesn't trust the new
+>   repo yet, an outdated test. Read which check is red before you debug SonarQube.
+
+---
+
 ## How developers use it day to day
 
 **Nothing to start by hand.** Open a PR into `main` and the scan runs. Push again and it runs again.
+
+**Logging in:** open `https://sonarqube.example.com` → **Log in with GitHub**. Your organisation account is enough; there's no separate SonarQube password.
 
 When the check is **red**:
 
 1. On the PR, open **Checks → SonarQube Code Analysis → View in SonarQube.**
 2. **Overview** shows which gate condition failed.
 3. **Issues:** each finding with file, line, severity, and "Why is this an issue?" / "How can I fix it?".
-4. **Security Hotspots:** code that needs a security review. Fix it, or have a reviewer mark it **Safe** with a reason.
+4. **Security Hotspots:** code that needs a security review. Fix it, or ask a lead to review it and mark it **Safe** with a reason (developers can't do that themselves; see step 13).
 5. Fix, push. The check updates by itself.
 
 To see **everything** (not just one PR): log in → **Projects → your-app** → branch `main` → **Issues**, filtered by **Severity** or by **Directory** (for example your own service folder).
@@ -580,6 +755,13 @@ Every one of these happened to me during this setup.
 | Merge queue waits forever | Required check doesn't run on `merge_group` | Add the `merge_group` trigger |
 | A second empty project appears | Scan used a key that doesn't match the project | Update the project key before the first scan |
 | SonarQube log: `flood stage disk watermark` | Disk nearly full | Grow the volume (40 GB+) |
+| Required check stuck on "Expected — Waiting for status to be reported" | The workflow file isn't on the PR's base branch | Merge the workflow into every base branch first, then **Update branch** on stuck PRs (step 15) |
+| New PR fails in seconds although `SONAR_TOKEN` now exists | The PR was opened before the secret was added | Re-run the failed job; no need for a new PR |
+| "Project's Main Branch is not analyzed yet" | Nothing has been pushed to `main` with the workflow on it | Merge the PR into `main`, or **Run workflow** on `main` |
+| Project card shows another branch, not `main` | The main branch was renamed in SonarQube | Rename it back (branch selector → Manage branches) |
+| An imported project shows **Public** | Visibility not set for this project | **Project settings → Permissions → Private** |
+| GitHub login: "Incorrect username or password" | Enterprise Managed Users have no GitHub password | Sign in through the company identity provider (step 14.3) |
+| GitHub login doesn't let members in | App lacks Members / Email permissions, or the change wasn't accepted | Step 14.1, then **Accept new permissions** |
 
 The most useful command during setup:
 
@@ -595,6 +777,8 @@ The `Caused by:` line nearest the bottom is usually the real reason.
 
 - **Give the VM its own IAM role** with only what it needs (for example SSM for shell access). Don't reuse an application's role. SonarQube runs a third-party plugin and should not be able to read your application secrets.
 - **The token is scoped.** A project analysis token from a CI-only user can analyse one project, nothing else.
+- **Only leads can override the gate.** Developers can read issues and code, but accepting an issue or marking a hotspot safe is limited to a leads group (step 13).
+- **Login follows your organisation.** With GitHub login limited to your org (step 14), removing someone from the org, or from the company identity provider, removes their SonarQube access too.
 - **Keep SonarQube off the open internet.** Behind the load balancer, only office and runner IPs can reach it, and login is forced.
 - **The NAT IP you add to GitHub's allow list may be shared** by other servers in the same subnets. It's usually acceptable because they still need valid credentials, but say so to whoever approves the change.
 - **Never put a real secret in a test PR.** Use an obviously fake value, as in the example above.
@@ -623,13 +807,13 @@ The image copies the plugin jar into place on every start, so a persistent `exte
 
 ## What's next
 
-This is phase one: one repository, gated on PRs into production. Here's my roadmap.
+Done so far: the PR quality gate, GitHub organisation login, a permission model where only leads can override the gate, and the same setup on three repositories. Here's my roadmap.
 
 ### Roll out to every repository
 
 - **Reusable workflow.** Move the job into one central repo as a `workflow_call` workflow, so each repo only has a few lines and fixes happen in one place.
 - **Org-level ruleset.** Require the `SonarQube` check from an **organisation ruleset** that targets repositories by name pattern or custom property, instead of editing every repo.
-- **One project per repo.** Import each repo with "Import from GitHub", set a short key, and assign the gate. The GitHub App just needs to be installed on the extra repositories.
+- **Organisation-level secret and variable.** One `SONAR_HOST_URL` variable and one token secret shared with selected repositories, instead of setting them per repo. That needs a global analysis token, which can scan every project, so weigh it against per-project tokens.
 
 ### Make the gate smarter
 
@@ -640,7 +824,7 @@ This is phase one: one repository, gated on PRs into production. Here's my roadm
 ### Improve the developer experience
 
 - **SonarQube for IDE (SonarLint) in connected mode,** so developers see the same rules in VS Code before they even push.
-- **Personal accounts or GitHub login** instead of a shared login, so you know who marked a hotspot as safe.
+- **GitHub teams as SonarQube groups,** so a lead added to the right GitHub team gets the lead permissions automatically.
 - **Chat notifications:** a webhook from SonarQube or a small workflow step that posts failed gates to Slack, Teams or Mattermost.
 - **A weekly summary** of new, fixed and open issues per repository for the team leads.
 
@@ -657,7 +841,7 @@ SonarQube is one layer. In the same PR checks we also run **secret scanning (git
 
 ### When to move to a paid edition
 
-If you depend heavily on PR analysis across many repos, or the plugin lags too far behind SonarQube releases, **Developer Edition** (or SonarQube Cloud) gives the same workflow with official support. Everything in steps 4–12 stays the same.
+If you depend heavily on PR analysis across many repos, or the plugin lags too far behind SonarQube releases, **Developer Edition** (or SonarQube Cloud) gives the same workflow with official support. Everything in steps 4–15 stays the same.
 
 ---
 
